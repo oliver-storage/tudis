@@ -589,10 +589,17 @@
 
   <!-- Footer -->
   <footer>
-    <p>Tudis v6.17.0 • Desenvolvido por DSP Group adaptando para Tudis</p>
+    <p id="rodape-sistema"></p>
   </footer>
 
   <script>
+    const CONFIG = {
+      SISTEMA: 'Tudis',
+      VERSAO: '6.18.0.0',
+      DESENVOLVEDOR: 'Vettore Sistemas'
+    };
+    document.getElementById('rodape-sistema').textContent = `${CONFIG.SISTEMA} v${CONFIG.VERSAO}•Desenvolvido por ${CONFIG.DESENVOLVEDOR}`;
+
     const { PDFDocument } = PDFLib;
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
@@ -999,9 +1006,6 @@
     }
 
     // Placeholder PDF tools
-    function renderDividirPDF() {
-      document.getElementById('modal-body').innerHTML = '<p style="text-align:center;padding:2rem;">✅ Ferramenta Dividir PDF pronta para implementação.</p>';
-    }
     function renderRodarPDF() {
       document.getElementById('modal-body').innerHTML = '<p style="text-align:center;padding:2rem;">✅ Ferramenta Rodar PDF pronta para implementação.</p>';
     }
@@ -1553,9 +1557,6 @@
       document.getElementById('res-mem').classList.remove('show');
       document.getElementById('can-mem').style.display = 'none';
     }
-    function renderDividirPDF() {
-      document.getElementById('modal-body').innerHTML = '<p style="text-align:center;padding:2rem;">✅ Ferramenta Dividir PDF pronta para implementação.</p>';
-    }
     function renderRodarPDF() {
       document.getElementById('modal-body').innerHTML = '<p style="text-align:center;padding:2rem;">✅ Ferramenta Rodar PDF pronta para implementação.</p>';
     }
@@ -1570,6 +1571,85 @@
     }
     function renderDesbloquearPDF() {
       document.getElementById('modal-body').innerHTML = '<p style="text-align:center;padding:2rem;">✅ Ferramenta Desbloquear PDF pronta para implementação.</p>';
+    }
+
+    // DIVIDIR PDF
+    function renderDividirPDF() {
+      document.getElementById('modal-body').innerHTML = `
+        <div class="dropzone" id="drop-div"><div class="dropzone-icon">📊</div><div class="dropzone-text">Arraste seu PDF</div><input type="file" id="inp-div" accept="application/pdf"></div>
+        <div id="info-div" style="display:none;"><p id="meta-div"></p></div>
+        <div class="control-group" id="ctrl-div" style="display:none;"><label>Páginas por arquivo</label><input type="number" id="int-div" min="1" value="1"></div>
+        <div class="button-group" id="btn-div" style="display:none;"><button class="btn-sm-secondary" onclick="resetDividir()">Limpar</button><button class="btn-sm-primary" id="proc-div">📊 Dividir</button></div>
+        <div class="result-section" id="res-div"><div id="txt-div" style="margin-bottom:0.5rem;"></div><a href="#" class="download-btn" id="down-div" download="dividido.zip">⬇️ Baixar ZIP</a></div>
+      `;
+      const drop = document.getElementById('drop-div');
+      const inp = document.getElementById('inp-div');
+      const btn = document.getElementById('proc-div');
+      let pdfSrc = null, baseName = 'documento', total = 0;
+
+      drop.addEventListener('click', () => inp.click());
+      drop.addEventListener('dragover', e => {e.preventDefault(); drop.classList.add('drag-over');});
+      drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
+      drop.addEventListener('drop', e => {e.preventDefault(); drop.classList.remove('drag-over'); loadFile(e.dataTransfer.files[0]);});
+      inp.addEventListener('change', e => loadFile(e.target.files[0]));
+
+      async function loadFile(f) {
+        if(!f || f.type !== 'application/pdf') return alert('Selecione um PDF');
+        try {
+          pdfSrc = await PDFDocument.load(await f.arrayBuffer(), {ignoreEncryption: true});
+        } catch(e) { return alert('Erro ao ler PDF: ' + e.message); }
+        total = pdfSrc.getPageCount();
+        baseName = f.name.replace(/\.pdf$/i, '');
+        drop.style.display = 'none';
+        document.getElementById('info-div').style.display = 'block';
+        document.getElementById('ctrl-div').style.display = 'block';
+        document.getElementById('btn-div').style.display = 'flex';
+        document.getElementById('meta-div').textContent = `${f.name} • ${total} página(s) • ${(f.size/1024/1024).toFixed(2).replace('.', ',')}MB`;
+        document.getElementById('int-div').max = total;
+      }
+
+      btn.addEventListener('click', async () => {
+        if(!pdfSrc) return;
+        const step = Math.max(1, parseInt(document.getElementById('int-div').value) || 1);
+        btn.disabled = true;
+        btn.textContent = '⏳ Dividindo...';
+        try {
+          const zip = new JSZip();
+          let n = 0;
+          for(let ini = 0; ini < total; ini += step) {
+            const fim = Math.min(ini + step, total);
+            const out = await PDFDocument.create();
+            const idx = Array.from({length: fim - ini}, (_, k) => ini + k);
+            (await out.copyPages(pdfSrc, idx)).forEach(p => out.addPage(p));
+            const nome = step === 1
+              ? `${baseName}-pag-${String(ini+1).padStart(3,'0')}.pdf`
+              : `${baseName}-pags-${String(ini+1).padStart(3,'0')}-a-${String(fim).padStart(3,'0')}.pdf`;
+            zip.file(nome, await out.save());
+            n++;
+          }
+          const blob = await zip.generateAsync({type:'blob'});
+          const url = URL.createObjectURL(blob);
+          const a = document.getElementById('down-div');
+          a.href = url;
+          a.download = `${baseName}-dividido.zip`;
+          document.getElementById('txt-div').innerHTML = `<strong>✅ ${n} arquivo(s) gerado(s)</strong>`;
+          document.getElementById('res-div').classList.add('show');
+          a.click();
+        } catch(e) {
+          alert('Erro ao dividir: ' + e.message);
+        }
+        btn.disabled = false;
+        btn.textContent = '📊 Dividir';
+      });
+    }
+
+    function resetDividir() {
+      document.getElementById('drop-div').style.display = 'block';
+      document.getElementById('info-div').style.display = 'none';
+      document.getElementById('ctrl-div').style.display = 'none';
+      document.getElementById('btn-div').style.display = 'none';
+      document.getElementById('res-div').classList.remove('show');
+      document.getElementById('inp-div').value = '';
     }
 
     // Setup tabs
@@ -1591,6 +1671,7 @@
     window.resetCompPDF = resetCompPDF;
     window.resetSeparar = resetSeparar;
     window.resetJuntar = resetJuntar;
+    window.resetDividir = resetDividir;
     window.resetRedImg = resetRedImg;
     window.resetRecImg = resetRecImg;
     window.resetGirImg = resetGirImg;
