@@ -595,7 +595,7 @@
   <script>
     const CONFIG = {
       SISTEMA: 'Tudis',
-      VERSAO: '6.18.0.0',
+      VERSAO: '6.19.0.0',
       DESENVOLVEDOR: 'Vettore Sistemas'
     };
     document.getElementById('rodape-sistema').textContent = `${CONFIG.SISTEMA} v${CONFIG.VERSAO}•Desenvolvido por ${CONFIG.DESENVOLVEDOR}`;
@@ -926,82 +926,327 @@
       document.getElementById('res-comp').classList.remove('show');
     }
 
-    // COMPRIMIR PDF
+    // COMPRIMIR PDF — motor de recompressão de imagens (preserva texto, vetores, links, formulários e metadados)
+    const NIVEIS_CPDF = {
+      basico:   {nome: 'Básico',   dpi: 200, q: 0.80, a4: false},
+      moderado: {nome: 'Moderado', dpi: 150, q: 0.65, a4: true},
+      forte:    {nome: 'Forte',    dpi: 120, q: 0.55, a4: true}
+    };
+
+    function fmtTam(b) {
+      const o = {minimumFractionDigits: 1, maximumFractionDigits: 1};
+      return b < 1024*1024 ? (b/1024).toLocaleString('pt-BR', o) + ' kB' : (b/1024/1024).toLocaleString('pt-BR', o) + ' MB';
+    }
+
+    async function cpdfStreamPipe(bytes, stream) {
+      return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer());
+    }
+
+    function cpdfUnpredict(data, colors, columns) {
+      const rb = columns * colors, rows = Math.floor(data.length / (rb + 1));
+      const out = new Uint8Array(rows * rb);
+      let prev = new Uint8Array(rb);
+      for(let r = 0; r < rows; r++) {
+        const ft = data[r*(rb+1)], src = r*(rb+1) + 1, cur = out.subarray(r*rb, (r+1)*rb);
+        for(let i = 0; i < rb; i++) {
+          const x = data[src+i], a = i >= colors ? cur[i-colors] : 0, b = prev[i], c = i >= colors ? prev[i-colors] : 0;
+          let v;
+          if(ft === 0) v = x;
+          else if(ft === 1) v = x + a;
+          else if(ft === 2) v = x + b;
+          else if(ft === 3) v = x + ((a + b) >> 1);
+          else { const p = a + b - c, pa = Math.abs(p-a), pb = Math.abs(p-b), pc = Math.abs(p-c); v = x + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c); }
+          cur[i] = v & 255;
+        }
+        prev = cur;
+      }
+      return out;
+    }
+
+    function cpdfComponentes(ctx, cs) {
+      const {PDFName, PDFArray} = PDFLib;
+      cs = ctx.lookup(cs);
+      if(cs instanceof PDFName) return ({'/DeviceRGB': 3, '/DeviceGray': 1})[cs.toString()] || 0;
+      if(cs instanceof PDFArray && cs.size() > 0) {
+        const tipo = ctx.lookup(cs.get(0)).toString();
+        if(tipo === '/CalRGB') return 3;
+        if(tipo === '/CalGray') return 1;
+        if(tipo === '/ICCBased') {
+          const icc = ctx.lookup(cs.get(1));
+          const n = icc && icc.dict ? icc.dict.lookup(PDFName.of('N')) : null;
+          return n && (n.asNumber() === 1 || n.asNumber() === 3) ? n.asNumber() : 0;
+        }
+      }
+      return 0;
+    }
+
+    function cpdfFiltros(dict) {
+      const {PDFName, PDFArray} = PDFLib;
+      const f = dict.lookup(PDFName.of('Filter'));
+      if(!f) return [];
+      if(f instanceof PDFArray) return Array.from({length: f.size()}, (_, i) => dict.context.lookup(f.get(i)).toString());
+      return [f.toString()];
+    }
+
+    // Decodifica a imagem para um bitmap; retorna null se o formato não for seguro de recomprimir
+    async function cpdfDecodificar(ctx, stream) {
+      const {PDFName, PDFArray, PDFBool} = PDFLib;
+      const d = stream.dict;
+      const num = k => { const v = d.lookup(PDFName.of(k)); return v && v.asNumber ? v.asNumber() : 0; };
+      const w = num('Width'), h = num('Height'), bpc = num('BitsPerComponent');
+      if(!w || !h || w*h < 40000 || bpc !== 8) return null;
+      if(d.lookup(PDFName.of('ImageMask')) === PDFBool.True) return null;
+      if(d.lookup(PDFName.of('Decode'))) return null;
+      if(d.lookup(PDFName.of('Mask')) instanceof PDFArray) return null; // máscara por cor exige pixels exatos
+      const n = cpdfComponentes(ctx, d.get(PDFName.of('ColorSpace')));
+      if(!n) return null; // CMYK, Indexed, Separation, Lab etc. ficam intactos
+      const filtros = cpdfFiltros(d);
+      const bruto = stream.contents;
+
+      if(filtros.includes('/DCTDecode')) {
+        if(filtros.length !== 1) return null;
+        const bmp = await createImageBitmap(new Blob([bruto], {type: 'image/jpeg'}));
+        if(bmp.width !== w || bmp.height !== h) { bmp.close(); return null; }
+        return {bmp, w, h, n, jpeg: true};
+      }
+      if(filtros.some(f => !['/FlateDecode', '/LZWDecode', '/ASCII85Decode', '/ASCIIHexDecode', '/RunLengthDecode'].includes(f))) return null;
+
+      let parms = d.lookup(PDFName.of('DecodeParms'));
+      if(parms instanceof PDFArray) parms = ctx.lookup(parms.get(parms.size()-1));
+      const pred = parms && parms.lookup && parms.lookup(PDFName.of('Predictor')) ? parms.lookup(PDFName.of('Predictor')).asNumber() : 1;
+      if(pred !== 1 && pred < 10) return null;
+
+      let px;
+      if(filtros.length === 1 && filtros[0] === '/FlateDecode') {
+        try { px = await cpdfStreamPipe(bruto, new DecompressionStream('deflate')); } catch(e) { px = null; }
+      }
+      if(!px && PDFLib.decodePDFRawStream) {
+        try { px = PDFLib.decodePDFRawStream(stream).decode(); } catch(e) { return null; }
+      }
+      if(!px) return null;
+      if(pred >= 10) px = cpdfUnpredict(px, n, w);
+      if(px.length < w*h*n) return null;
+
+      const rgba = new Uint8ClampedArray(w*h*4);
+      for(let i = 0, j = 0; i < w*h; i++, j += 4) {
+        if(n === 1) { rgba[j] = rgba[j+1] = rgba[j+2] = px[i]; }
+        else { rgba[j] = px[i*3]; rgba[j+1] = px[i*3+1]; rgba[j+2] = px[i*3+2]; }
+        rgba[j+3] = 255;
+      }
+      const bmp = await createImageBitmap(new ImageData(rgba, w, h));
+      return {bmp, w, h, n, jpeg: false};
+    }
+
+    async function cpdfJpeg(bmp, w, h, q) {
+      let src = bmp, sw = bmp.width, sh = bmp.height;
+      const novo = (a, b) => { if(typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(a, b); const c = document.createElement('canvas'); c.width = a; c.height = b; return c; };
+      // redução em etapas (metade por vez) para evitar serrilhado e preservar legibilidade
+      while(sw / 2 >= w && sh / 2 >= h) {
+        const c = novo(Math.round(sw/2), Math.round(sh/2)), x = c.getContext('2d');
+        x.imageSmoothingQuality = 'high';
+        x.drawImage(src, 0, 0, c.width, c.height);
+        src = c; sw = c.width; sh = c.height;
+      }
+      const c = novo(w, h), x = c.getContext('2d');
+      x.fillStyle = '#fff'; x.fillRect(0, 0, w, h);
+      x.imageSmoothingQuality = 'high';
+      x.drawImage(src, 0, 0, w, h);
+      const blob = c.convertToBlob ? await c.convertToBlob({type: 'image/jpeg', quality: q}) : await new Promise(r => c.toBlob(r, 'image/jpeg', q));
+      return new Uint8Array(await blob.arrayBuffer());
+    }
+
+    function cpdfColetarLixo(ctx) {
+      const {PDFRef, PDFDict, PDFArray, PDFStream} = PDFLib;
+      const vistos = new Set(), pilha = [ctx.trailerInfo.Root, ctx.trailerInfo.Info];
+      while(pilha.length) {
+        const o = pilha.pop();
+        if(!o) continue;
+        if(o instanceof PDFRef) {
+          const k = o.objectNumber + ' ' + o.generationNumber;
+          if(vistos.has(k)) continue;
+          vistos.add(k); pilha.push(ctx.lookup(o));
+        } else if(o instanceof PDFDict) { for(const [, v] of o.entries()) pilha.push(v); }
+        else if(o instanceof PDFArray) { for(let i = 0; i < o.size(); i++) pilha.push(o.get(i)); }
+        else if(o instanceof PDFStream) pilha.push(o.dict);
+      }
+      let removidos = 0;
+      for(const [ref] of ctx.enumerateIndirectObjects()) {
+        if(!vistos.has(ref.objectNumber + ' ' + ref.generationNumber)) { ctx.delete(ref); removidos++; }
+      }
+      return removidos;
+    }
+
+    async function comprimirPDFBytes(buf, nivel, progresso, cancelado) {
+      const {PDFDocument, PDFName, PDFNumber, PDFRawStream} = PDFLib;
+      const cfg = NIVEIS_CPDF[nivel];
+      const pdf = await PDFDocument.load(buf, {updateMetadata: false, ignoreEncryption: true});
+      if(pdf.isEncrypted) throw new Error('PDF protegido por senha/criptografia — não é possível comprimir sem remover a proteção.');
+      const ctx = pdf.context;
+
+      // limite de resolução: maior lado/menor lado de página × DPI alvo (conservador: nunca reduz abaixo do necessário para página inteira)
+      let pgL = 0, pgC = 0;
+      pdf.getPages().forEach(p => {
+        const {width, height} = p.getSize();
+        pgL = Math.max(pgL, width, height); pgC = Math.max(pgC, Math.min(width, height));
+        p.node.delete(PDFName.of('Thumb')); // miniaturas são regeneradas pelos leitores
+      });
+      // Moderado/Forte: páginas gigantes (ex.: scanner que grava 2480×3507 pt) são tratadas como A4 para cálculo do DPI
+      if(cfg.a4) { pgL = Math.min(pgL, 842); pgC = Math.min(pgC, 595); }
+      const maxL = pgL / 72 * cfg.dpi, maxC = pgC / 72 * cfg.dpi;
+
+      const imagens = [];
+      for(const [ref, obj] of ctx.enumerateIndirectObjects()) {
+        if(obj instanceof PDFRawStream && obj.dict.lookup(PDFName.of('Subtype')) === PDFName.of('Image')) imagens.push([ref, obj]);
+      }
+      let trocadas = 0;
+      for(let i = 0; i < imagens.length; i++) {
+        if(cancelado()) throw new Error('cancelado');
+        progresso(i + 1, imagens.length);
+        const [ref, st] = imagens[i];
+        let dec;
+        try { dec = await cpdfDecodificar(ctx, st); } catch(e) { dec = null; }
+        if(!dec) continue;
+        const escala = Math.min(1, maxL / Math.max(dec.w, dec.h), maxC / Math.min(dec.w, dec.h));
+        const reduz = escala < 0.9;
+        const nw = reduz ? Math.max(1, Math.round(dec.w * escala)) : dec.w;
+        const nh = reduz ? Math.max(1, Math.round(dec.h * escala)) : dec.h;
+        let jpg;
+        try { jpg = await cpdfJpeg(dec.bmp, nw, nh, cfg.q); } catch(e) { jpg = null; }
+        dec.bmp.close && dec.bmp.close();
+        // só substitui se houver ganho real (JPEG sem redução precisa render ≥15%, evitando perda à toa)
+        if(!jpg || jpg.length >= st.contents.length * (dec.jpeg && !reduz ? 0.85 : 0.95)) continue;
+        const nd = st.dict.clone(ctx);
+        ['Filter', 'DecodeParms', 'Length', 'DL'].forEach(k => nd.delete(PDFName.of(k)));
+        nd.set(PDFName.of('Width'), PDFNumber.of(nw));
+        nd.set(PDFName.of('Height'), PDFNumber.of(nh));
+        nd.set(PDFName.of('BitsPerComponent'), PDFNumber.of(8));
+        nd.set(PDFName.of('Filter'), PDFName.of('DCTDecode'));
+        if(dec.n === 1) nd.set(PDFName.of('ColorSpace'), PDFName.of('DeviceRGB'));
+        ctx.assign(ref, PDFRawStream.of(nd, jpg));
+        trocadas++;
+      }
+
+      // compressão sem perdas de fluxos que estão sem filtro (conteúdo de páginas, fontes etc.); XMP fica legível
+      for(const [ref, obj] of ctx.enumerateIndirectObjects()) {
+        if(!(obj instanceof PDFRawStream) || obj.dict.lookup(PDFName.of('Filter'))) continue;
+        if(obj.dict.lookup(PDFName.of('Type')) === PDFName.of('Metadata') || obj.contents.length < 512) continue;
+        try {
+          const z = await cpdfStreamPipe(obj.contents, new CompressionStream('deflate'));
+          if(z.length < obj.contents.length) {
+            const nd = obj.dict.clone(ctx);
+            nd.delete(PDFName.of('Length'));
+            nd.set(PDFName.of('Filter'), PDFName.of('FlateDecode'));
+            ctx.assign(ref, PDFRawStream.of(nd, z));
+          }
+        } catch(e) {}
+      }
+
+      const lixo = cpdfColetarLixo(ctx);
+      const bytes = await pdf.save({useObjectStreams: true});
+      return {bytes, trocadas, total: imagens.length, lixo};
+    }
+
     function renderComprimirPDF() {
       document.getElementById('modal-body').innerHTML = `
+        <style>
+          .cpdf-niveis{display:flex;gap:.5rem;margin:.5rem 0 1rem}
+          .cpdf-niveis button{flex:1;padding:.6rem;border:2px solid var(--gray-200);background:#fff;border-radius:8px;cursor:pointer;font-weight:600;color:var(--gray-700)}
+          .cpdf-niveis button.ativo{border-color:var(--primary);background:#eff6ff;color:var(--primary)}
+          .cpdf-est{background:var(--gray-50);border-radius:8px;padding:.8rem 1rem;margin-bottom:1rem}
+          .cpdf-est .novo{font-size:1.4rem;font-weight:700;color:var(--gray-900)}
+          .cpdf-est s{color:var(--gray-600);margin-left:.5rem}
+          .cpdf-est .pct{color:#10b981;font-weight:700;margin-left:.5rem}
+          .cpdf-aviso{background:#fff7ed;border:1px solid #fdba74;color:#9a3412;border-radius:8px;padding:.6rem .8rem;margin-bottom:1rem;font-size:.9rem}
+        </style>
         <div class="dropzone" id="drop-cpdf"><div class="dropzone-icon">🗜️</div><div class="dropzone-text">Arraste seu PDF</div><input type="file" id="inp-cpdf" accept="application/pdf"></div>
-        <div id="info-cpdf" style="display:none;"><p id="meta-cpdf"></p><p id="size-cpdf" style="color:#10b981;"></p></div>
-        <div class="control-group" id="ctrl-cpdf" style="display:none;"><label>Nível de Compressão</label><input type="range" id="level-cpdf" min="1" max="9" value="6"><small id="level-val">6/9 (Balanceado)</small></div>
-        <div class="button-group" id="btn-cpdf" style="display:none;"><button class="btn-sm-secondary" onclick="resetCompPDF()">Limpar</button><button class="btn-sm-primary" id="proc-cpdf">🗜️ Comprimir</button></div>
-        <div class="result-section" id="res-cpdf"><div style="margin-bottom:1rem;" id="compress-info"></div><a href="#" class="download-btn" id="down-cpdf" download="comprimido.pdf">⬇️ Baixar PDF</a></div>
+        <div id="info-cpdf" style="display:none;">
+          <p id="meta-cpdf" style="font-weight:600;"></p>
+          <div id="aviso-cpdf"></div>
+          <label style="font-weight:600;">Comprimir</label>
+          <div class="cpdf-niveis">
+            <button data-n="basico">Básico</button><button data-n="moderado" class="ativo">Moderado</button><button data-n="forte">Forte</button>
+          </div>
+          <div class="cpdf-est"><small>Tamanho estimado do novo arquivo</small><div id="est-cpdf"></div><small id="det-cpdf" style="color:var(--gray-600);"></small></div>
+        </div>
+        <div class="button-group" id="btn-cpdf" style="display:none;"><button class="btn-sm-secondary" onclick="resetCompPDF()">Limpar</button><button class="btn-sm-primary" id="proc-cpdf" disabled>🗜️ Comprimir</button></div>
       `;
       const drop = document.getElementById('drop-cpdf');
       const inp = document.getElementById('inp-cpdf');
       const btn = document.getElementById('proc-cpdf');
-      const level = document.getElementById('level-cpdf');
-      let file = null;
-      let originalSize = 0;
-
-      level.addEventListener('input', e => {
-        const levels = ['Máxima', 'Muito Alta', 'Alta', 'Média-Alta', 'Balanceado', 'Média-Baixa', 'Baixa', 'Muito Baixa', 'Mínima'];
-        document.getElementById('level-val').textContent = e.target.value + '/9 (' + levels[e.target.value-1] + ')';
-      });
+      const est = document.getElementById('est-cpdf');
+      const det = document.getElementById('det-cpdf');
+      let buf = null, nome = '', original = 0, nivel = 'moderado', cache = {}, sessao = 0;
 
       drop.addEventListener('click', () => inp.click());
       drop.addEventListener('dragover', e => {e.preventDefault(); drop.classList.add('drag-over');});
       drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
       drop.addEventListener('drop', e => {e.preventDefault(); drop.classList.remove('drag-over'); loadFile(e.dataTransfer.files[0]);});
       inp.addEventListener('change', e => loadFile(e.target.files[0]));
+      document.querySelectorAll('.cpdf-niveis button').forEach(b => b.addEventListener('click', () => {
+        document.querySelectorAll('.cpdf-niveis button').forEach(x => x.classList.remove('ativo'));
+        b.classList.add('ativo'); nivel = b.dataset.n; mostrar();
+      }));
+      window._cpdfCancelar = () => { sessao++; buf = null; cache = {}; };
 
-      async function loadFile(f) {
-        if(!f || f.type !== 'application/pdf') return alert('Selecione um PDF');
-        file = f;
-        originalSize = f.size;
-        drop.style.display = 'none';
-        document.getElementById('info-cpdf').style.display = 'block';
-        document.getElementById('ctrl-cpdf').style.display = 'block';
-        document.getElementById('btn-cpdf').style.display = 'flex';
-        document.getElementById('meta-cpdf').textContent = `${f.name}`;
-        document.getElementById('size-cpdf').textContent = `Tamanho original: ${(f.size/1024/1024).toFixed(2)}MB`;
+      function mostrar() {
+        const r = cache[nivel];
+        if(!r || r.calculando) {
+          est.innerHTML = `<span class="novo">calculando…</span><s>${fmtTam(original)}</s>`;
+          det.textContent = r && r.prog ? `Analisando imagem ${r.prog}` : '';
+          btn.disabled = true; return;
+        }
+        if(r.erro) { est.innerHTML = `<span style="color:#dc2626;">${r.erro}</span>`; det.textContent = ''; btn.disabled = true; return; }
+        const pct = Math.round((1 - r.bytes.length / original) * 100);
+        est.innerHTML = `<span class="novo">~${fmtTam(r.bytes.length)}</span><s>${fmtTam(original)}</s><span class="pct">(${pct > 0 ? '-' + pct : 0}%)</span>`;
+        det.textContent = r.semGanho ? 'Arquivo já otimizado — será mantido o original, sem alterações.' : `${r.trocadas} de ${r.total} imagem(ns) otimizada(s) • texto, links, formulários e metadados preservados`;
         btn.disabled = false;
       }
 
-      btn.addEventListener('click', async () => {
-        if(!file) return;
-        btn.disabled = true;
-        btn.textContent = '⏳ Comprimindo...';
+      async function calcular(n, s) {
+        cache[n] = {calculando: true};
         try {
-          const buf = await file.arrayBuffer();
-          const pdf = await PDFDocument.load(buf, {ignoreEncryption: true});
-          const bytes = await pdf.save();
-          const originalBytes = new Uint8Array(buf).length;
-          const compressedBytes = bytes.length;
-          const reduction = Math.round((1 - compressedBytes / originalBytes) * 100);
-          
-          const blob = new Blob([bytes], {type: 'application/pdf'});
-          const url = URL.createObjectURL(blob);
-          document.getElementById('down-cpdf').href = url;
-          document.getElementById('compress-info').innerHTML = `
-            <strong>✅ Sucesso!</strong><br>
-            Tamanho original: ${(originalBytes/1024/1024).toFixed(2)}MB<br>
-            Tamanho comprimido: ${(compressedBytes/1024/1024).toFixed(2)}MB<br>
-            Redução: <strong style="color:#10b981;">${reduction}%</strong>
-          `;
-          document.getElementById('res-cpdf').classList.add('show');
+          const r = await comprimirPDFBytes(buf.slice(0), n, (a, t) => { if(s === sessao) { cache[n].prog = `${a}/${t}`; if(n === nivel) mostrar(); } }, () => s !== sessao);
+          if(s !== sessao) return;
+          const semGanho = r.bytes.length >= original;
+          cache[n] = {...r, bytes: semGanho ? new Uint8Array(buf) : r.bytes, semGanho};
         } catch(e) {
-          alert('Erro ao comprimir: ' + e.message);
+          if(s !== sessao) return;
+          cache[n] = {erro: 'Erro: ' + e.message};
         }
-        btn.disabled = false;
-        btn.textContent = '🗜️ Comprimir';
+        if(n === nivel) mostrar();
+      }
+
+      async function loadFile(f) {
+        if(!f || f.type !== 'application/pdf') return alert('Selecione um PDF');
+        const s = ++sessao;
+        buf = await f.arrayBuffer(); nome = f.name.replace(/\.pdf$/i, ''); original = f.size; cache = {};
+        drop.style.display = 'none';
+        document.getElementById('info-cpdf').style.display = 'block';
+        document.getElementById('btn-cpdf').style.display = 'flex';
+        document.getElementById('meta-cpdf').textContent = f.name;
+        const txt = new TextDecoder('latin1').decode(new Uint8Array(buf));
+        document.getElementById('aviso-cpdf').innerHTML = /\/ByteRange\s*\[/.test(txt)
+          ? '<div class="cpdf-aviso">⚠️ Este PDF tem <strong>assinatura digital</strong>. Qualquer compressão invalida a assinatura. Guarde o original para fins legais.</div>' : '';
+        mostrar();
+        for(const n of ['moderado', 'basico', 'forte']) { if(s !== sessao) return; await calcular(n, s); }
+      }
+
+      btn.addEventListener('click', () => {
+        const r = cache[nivel];
+        if(!r || !r.bytes) return;
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([r.bytes], {type: 'application/pdf'}));
+        a.download = `${nome}-comprimido.pdf`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
       });
     }
 
     function resetCompPDF() {
+      window._cpdfCancelar && window._cpdfCancelar();
       document.getElementById('drop-cpdf').style.display = 'block';
       document.getElementById('info-cpdf').style.display = 'none';
-      document.getElementById('ctrl-cpdf').style.display = 'none';
       document.getElementById('btn-cpdf').style.display = 'none';
-      document.getElementById('res-cpdf').classList.remove('show');
       document.getElementById('inp-cpdf').value = '';
     }
 
